@@ -1,0 +1,1092 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Go-Stop-Go · Asia-session research strategy for NQ / MNQ (1-minute chart)
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Pattern (described for a long; shorts are mirrored everywhere):
+//    GO   an impulse leg in the bias direction that stands out against recent ATR
+//    STOP a horizontal pause right after the leg: flat top, flat bottom
+//    GO   a buy-stop one tick above the STOP high catches the continuation
+//
+//  Why the script is shaped the way it is
+//  • Everything is decided on bar close (calc_on_every_tick = false,
+//    process_orders_on_close = false). An order submitted on the close of bar t
+//    can only fill inside bar t+1, so no decision uses a price that had not
+//    printed yet. Realtime behaves exactly like history.
+//  • The 15m bias uses request.security(expr[1], lookahead_on): TradingView's
+//    documented non-repainting idiom. It always returns the last *fully closed*
+//    15m bar, on historical and realtime bars alike (README, assumption 1).
+//  • Intrabar sequencing on 1m bars. Without Bar Magnifier, TradingView's broker
+//    emulator assumes a bar travelled open → nearer extreme → farther extreme →
+//    close. If a stop and a target both sit inside one bar, the emulator picks
+//    the winner by that rule, which is NOT always stop-first, and a script cannot
+//    override it. Therefore:
+//      - real fills (strategy P&L, "actual net R") follow the emulator;
+//      - every research simulation in this script (MFE, expansion, the shadow
+//        "Always 2R" / "Always 1R+BE" results) assumes the STOP printed first,
+//        which is the conservative choice, and flags the bar as "ambiguous".
+//    The stats table shows how many trades contain an ambiguous bar. Turning on
+//    Bar Magnifier (Properties tab, premium plans) lets the emulator resolve real
+//    fills on lower-timeframe data; the research sims stay conservative.
+// ═══════════════════════════════════════════════════════════════════════════════
+strategy("Go-Stop-Go Asia Session", shorttitle = "GSG Asia", overlay = true,
+     initial_capital          = 100000,
+     currency                 = currency.USD,
+     default_qty_type         = strategy.fixed,
+     default_qty_value        = 1,
+     commission_type          = strategy.commission.cash_per_contract,
+     commission_value         = 2.25,
+     slippage                 = 1,
+     pyramiding               = 0,
+     process_orders_on_close  = false,
+     calc_on_every_tick       = false,
+     calc_on_order_fills      = false,
+     use_bar_magnifier        = false,
+     margin_long              = 0,
+     margin_short             = 0,
+     max_lines_count          = 500,
+     max_boxes_count          = 500,
+     max_labels_count         = 500)
+// Commission / slippage / initial capital cannot be input.*() values: Pine only
+// accepts constants in strategy(). Edit them in Settings → Properties.
+// 2.25 USD per contract per side approximates NQ all-in costs; use ~0.62 for MNQ.
+// margin_* = 0 disables TradingView's margin-call simulation (v6 defaults to 100 %,
+// which would reject a single NQ contract on a 100k account). Use "Max contracts"
+// below if you want a hard size ceiling instead.
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Constants
+// ───────────────────────────────────────────────────────────────────────────────
+const string TZ        = "America/New_York"
+const int    MFE_END_H = 23      // MFE / expansion horizon: 23:59 ET on the entry day
+const int    MFE_END_M = 59
+const int    DAY_MS    = 86400000
+
+const color C_UP     = #26a69a
+const color C_DN     = #ef5350
+const color C_ENTRY  = #2962ff
+const color C_TGT    = #00c853
+const color C_GREY   = #787b86
+const color C_GAP    = #ff9800
+const color C_TXT    = #e0e3eb
+const color C_HEAD   = #2a2e39
+const color C_ROW    = #131722
+const color C_ROW2   = #1c2030
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Inputs. Every tunable threshold from the spec lives here, grouped by concern.
+// ───────────────────────────────────────────────────────────────────────────────
+const string G_SES   = "Session"
+const string G_RISK  = "Risk"
+const string G_BIAS  = "Bias"
+const string G_GO    = "GO Leg"
+const string G_STOP  = "STOP"
+const string G_ENTRY = "Entry"
+const string G_MGMT  = "Management"
+const string G_VIS   = "Visuals"
+const string G_STATS = "Stats"
+
+i_window    = input.session("2000-2230", "Entry window (ET)", group = G_SES, tooltip = "Entry orders can only be working (and so only trigger) inside this window. Unfilled orders are cancelled at the end.")
+i_preSess   = input.session("1800-2000", "Day-type range window (ET)", group = G_SES, tooltip = "Range used to classify Momentum vs Safe days. It is complete before the entry window opens, so there is no look-ahead.")
+i_flatten   = input.bool(false, "Flatten at window end", group = G_SES, tooltip = "Off: positions open at window end keep running to stop/target. On: they are closed at market at the window end.")
+i_maxTrades = input.int(3, "Max trades per session", minval = 1, group = G_SES)
+i_maxLosses = input.int(2, "Losing trades that end the session", minval = 1, group = G_SES, tooltip = "A loss is a trade whose net R < 0 (after costs).")
+
+i_riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.1, group = G_RISK)
+i_riskCap   = input.float(2.0, "Skip if 1 contract risks more than × budget", minval = 1.0, step = 0.1, group = G_RISK)
+i_maxQty    = input.int(0, "Max contracts (0 = no cap)", minval = 0, group = G_RISK)
+
+i_biasTf    = input.timeframe("15", "Bias timeframe", group = G_BIAS)
+i_emaLen    = input.int(50, "Bias EMA length", minval = 1, group = G_BIAS)
+i_useGap    = input.bool(true, "Sunday-gap override", group = G_BIAS)
+i_gapPts    = input.float(100.0, "Major gap threshold (points)", minval = 0.0, group = G_BIAS)
+i_gapExpire = input.int(0, "Gap override expires after N sessions (0 = only when filled)", minval = 0, group = G_BIAS)
+i_showEma   = input.bool(false, "Plot bias EMA (last closed 15m value)", group = G_BIAS)
+
+i_atrLen    = input.int(14, "ATR length (1m)", minval = 1, group = G_GO)
+i_legAtr    = input.float(2.5, "Min leg size (× ATR)", minval = 0.25, step = 0.25, group = G_GO, tooltip = "Net move from the leg's extreme low to extreme high. Spec suggests testing 2–4.")
+i_legSame   = input.int(3, "Min same-direction candles", minval = 1, group = G_GO)
+i_legOpp    = input.int(1, "Max small opposite candles", minval = 0, group = G_GO)
+i_legOppB   = input.float(0.30, "Small opposite candle: body < × ATR", minval = 0.0, step = 0.05, group = G_GO)
+i_legBody   = input.float(60.0, "Min average body / range (%)", minval = 0.0, maxval = 100.0, group = G_GO)
+
+i_stopMin   = input.int(3, "Min STOP bars", minval = 2, group = G_STOP)
+i_stopMax   = input.int(30, "Max STOP bars", minval = 3, maxval = 200, group = G_STOP)
+i_k         = input.float(0.25, "Flatness tolerance k (× ATR)", minval = 0.01, step = 0.05, group = G_STOP, tooltip = "Touch band width AND the maximum regression drift (slope × bars) of the STOP highs and of the STOP lows.")
+i_bkTouch   = input.int(2, "Min touches of breakout level", minval = 1, group = G_STOP, tooltip = "Top for longs, bottom for shorts. A touch is a separate visit to the band within k × ATR of the level.")
+i_farTouch  = input.int(1, "Min touches of opposite level", minval = 1, group = G_STOP, tooltip = "1 = no extra filter (spec only requires the breakout level to be touched twice).")
+
+i_entTicks  = input.int(1, "Entry offset beyond STOP (ticks)", minval = 0, group = G_ENTRY)
+i_slTicks   = input.int(1, "Stop-loss offset beyond swing (ticks)", minval = 0, group = G_ENTRY)
+i_pivL      = input.int(1, "Swing pivot left bars", minval = 1, group = G_ENTRY)
+i_pivR      = input.int(1, "Swing pivot right bars", minval = 1, group = G_ENTRY)
+
+i_mgmt      = input.string("Auto (day type)", "Management override", options = ["Auto (day type)", "Always 2R", "Always 1R+BE"], group = G_MGMT)
+i_tgtR      = input.float(2.0, "Full-exit target (R)", minval = 0.1, step = 0.25, group = G_MGMT, tooltip = "Momentum days / 'Always 2R'. Also the target of the 'Always 2R' shadow.")
+i_partR     = input.float(1.0, "Partial exit at (R)", minval = 0.1, step = 0.25, group = G_MGMT)
+i_partPct   = input.float(50.0, "Partial size (%)", minval = 1.0, maxval = 99.0, group = G_MGMT)
+i_runR      = input.float(2.0, "Runner target (R)", minval = 0.1, step = 0.25, group = G_MGMT)
+i_momMult   = input.float(1.5, "Momentum day: pre-window range ≥ × average", minval = 0.1, step = 0.1, group = G_MGMT)
+i_momLook   = input.int(20, "Momentum day: average lookback (sessions)", minval = 1, group = G_MGMT)
+
+i_showWin   = input.bool(true, "Shade entry window", group = G_VIS)
+i_showGap   = input.bool(true, "Gap mode tint + Friday-close line", group = G_VIS)
+i_showLeg   = input.bool(true, "GO leg line", group = G_VIS)
+i_showStop  = input.bool(true, "STOP box", group = G_VIS)
+i_showLvls  = input.bool(true, "Entry / stop / target lines", group = G_VIS)
+i_showLbls  = input.bool(true, "Trade labels", group = G_VIS)
+i_showSkips = input.bool(false, "Skip / cancel markers", group = G_VIS)
+i_keepCxl   = input.bool(false, "Keep drawings of cancelled setups", group = G_VIS)
+
+i_showTable = input.bool(true, "Show stats table", group = G_STATS)
+i_tblSize   = input.string("Tiny", "Table text size", options = ["Tiny", "Small", "Normal"], group = G_STATS)
+i_showLog   = input.bool(false, "Show trade log table", group = G_STATS)
+i_logRows   = input.int(12, "Trade log rows", minval = 1, maxval = 40, group = G_STATS)
+i_maxRecs   = input.int(3000, "Max trades kept in stats arrays", minval = 50, maxval = 20000, group = G_STATS)
+
+string tblSize = i_tblSize == "Small" ? size.small : i_tblSize == "Normal" ? size.normal : size.tiny
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Time helpers. Sessions are parsed once into minutes-of-day (ET).
+// ───────────────────────────────────────────────────────────────────────────────
+f_hhmm(string s, int from) =>
+    int(str.tonumber(str.substring(s, from, from + 2))) * 60 + int(str.tonumber(str.substring(s, from + 2, from + 4)))
+
+f_mod(int t) =>
+    hour(t, TZ) * 60 + minute(t, TZ)
+
+// True when minute-of-day m is in [s, e); handles windows that cross midnight.
+f_in(int m, int s, int e) =>
+    s <= e ? (m >= s and m < e) : (m >= s or m < e)
+
+int winS = f_hhmm(i_window, 0)
+int winE = f_hhmm(i_window, 5)
+int preS = f_hhmm(i_preSess, 0)
+int preE = f_hhmm(i_preSess, 5)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Types
+// ───────────────────────────────────────────────────────────────────────────────
+// A GO-leg candidate. One tracker per direction runs on every bar.
+type Leg
+    int   dir
+    bool  active  = false
+    int   startBar
+    int   endBar
+    float hi
+    float lo
+    int   nSame   = 0
+    int   nOpp    = 0
+    int   nBars   = 0
+    float bodySum = 0.0
+    float atrRef
+
+// A GO leg plus the STOP forming after it, and the working order (if any).
+type Setup
+    int          dir
+    string       oid
+    int          legStart
+    int          legEnd
+    float        legHi
+    float        legLo
+    float        atrRef
+    int          stopStart
+    array<float> hs
+    array<float> ls
+    float        top
+    float        bot
+    float        swing
+    int          tBk     = 0
+    int          tFar    = 0
+    float        driftH
+    float        driftL
+    bool         valid   = false
+    bool         armed   = false
+    bool         live    = false
+    bool         everOrd = false
+    string       block   = ""
+    line         goLine
+    box          stopBox
+    float        pxE
+    float        pxS
+    float        rPts
+    int          qty
+    int          mgmt
+    float        t1
+    float        tEnd
+    bool         mom     = false
+    bool         gap     = false
+    int          nSnap
+    float        topSnap
+    float        botSnap
+
+// One taken trade: what it looked like, what it did, and what it could have done.
+type Rec
+    string oid
+    int    t
+    int    bar
+    int    sess
+    int    dir
+    bool   mom       = false
+    bool   gap       = false
+    int    mgmt
+    float  legPts
+    float  legAtr
+    int    stopBars
+    float  stopAtr
+    float  depth
+    float  entry
+    float  sl
+    float  riskPts
+    int    qty
+    float  t1
+    float  tEnd
+    float  tFull
+    float  tRun
+    float  legHi
+    float  legLo
+    float  stopTop
+    float  stopBot
+    float  pnl       = 0.0
+    float  netR
+    bool   beDone    = false
+    label  lbl
+    int    horizon
+    bool   mfeOpen   = true
+    float  best
+    float  mfeR
+    float  expansion
+    float  sh2
+    float  shB
+    int    shBPhase  = 0
+    bool   ambiguous = false
+
+// A bucket of results for the stats table.
+type Bag
+    array<float> r
+    array<float> mfe
+    array<float> ex
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Persistent state
+// ───────────────────────────────────────────────────────────────────────────────
+var Leg         legUp     = Leg.new(dir = 1)
+var Leg         legDn     = Leg.new(dir = -1)
+var Setup       su        = na
+var Rec         act       = na                       // the trade currently open in the engine
+var array<Rec>  recs      = array.new<Rec>()         // every taken trade (capped)
+var array<Rec>  liveRecs  = array.new<Rec>()         // trades whose research tracker is still running
+var map<string, int> skipMap = map.new<string, int>()
+var int         lastClosed = 0
+var int         oidSeq     = 0
+var int         nArmed     = 0
+var int         nTaken     = 0
+
+var int   sessNo     = 0
+var int   sessTrades = 0
+var int   sessLosses = 0
+var bool  sessMom    = false
+var array<float> preRanges = array.new<float>()
+var float preHi    = na
+var float preLo    = na
+var int   preStart = na
+
+var float friClose = na
+var bool  gapOn    = false
+var int   gapDir   = 0
+var int   gapSess  = 0
+var line  gapLn    = na
+
+// ───────────────────────────────────────────────────────────────────────────────
+// GO leg detection
+// A leg is a run of bars that each make a new extreme in its direction. It ends on
+// the first bar that fails to (or on a second / large opposite candle); that bar
+// becomes STOP bar 1. Validation uses the ATR of the bar *before* the leg began,
+// so the leg is judged against the price action it is supposed to stand out from.
+// Returns a copy of the completed leg when it qualifies, otherwise na.
+// ───────────────────────────────────────────────────────────────────────────────
+method upd(Leg this, float atrPrev) =>
+    float rng     = high - low
+    float body    = math.abs(close - open)
+    float bodyPct = rng > 0 ? body / rng * 100.0 : 0.0
+    bool  same    = this.dir > 0 ? close > open : close < open
+    Leg   done    = na
+    if this.active
+        bool newExt   = this.dir > 0 ? high > this.hi : low < this.lo
+        // Dojis count as opposite candles: they are a pause, not a push.
+        bool smallOpp = not same and body < i_legOppB * this.atrRef
+        if newExt and (same or (smallOpp and this.nOpp < i_legOpp))
+            this.hi      := math.max(this.hi, high)
+            this.lo      := math.min(this.lo, low)
+            this.endBar  := bar_index
+            this.nBars   := this.nBars + 1
+            this.nSame   := this.nSame + (same ? 1 : 0)
+            this.nOpp    := this.nOpp + (same ? 0 : 1)
+            this.bodySum := this.bodySum + bodyPct
+        else
+            bool bigEnough = this.hi - this.lo >= i_legAtr * this.atrRef
+            bool enough    = this.nSame >= i_legSame
+            bool solid     = this.bodySum / this.nBars >= i_legBody
+            if bigEnough and enough and solid
+                done := this.copy()
+            this.active := false
+    // A new candidate can only start on a same-direction candle.
+    if not this.active and same and not na(atrPrev) and atrPrev > 0
+        this.active   := true
+        this.startBar := bar_index
+        this.endBar   := bar_index
+        this.hi       := high
+        this.lo       := low
+        this.nSame    := 1
+        this.nOpp     := 0
+        this.nBars    := 1
+        this.bodySum  := bodyPct
+        this.atrRef   := atrPrev
+    done
+
+// ───────────────────────────────────────────────────────────────────────────────
+// STOP evaluation. Recomputed from scratch on every bar (≤ i_stopMax bars), so the
+// definition never depends on the order in which bars arrived.
+//   top / bot        highest high / lowest low of the STOP bars
+//   touches          separate visits to the band within k × ATR of a level
+//                    (consecutive bars inside the band count once)
+//   drift            |least-squares slope| × bar count, for highs and for lows;
+//                    must be ≤ k × ATR, which rejects ranges that lean
+//   swing            most recent pivot low (long) / high (short) inside the
+//                    STOP, falling back to the STOP extreme. The stop goes beyond it.
+// ───────────────────────────────────────────────────────────────────────────────
+method evalStop(Setup s) =>
+    int   n    = s.hs.size()
+    float top  = s.hs.max()
+    float bot  = s.ls.min()
+    float tol  = i_k * s.atrRef
+    int   tTop = 0
+    int   tBot = 0
+    bool  wasT = false
+    bool  wasB = false
+    float sx   = 0.0
+    float sxx  = 0.0
+    float syH  = 0.0
+    float syL  = 0.0
+    float sxyH = 0.0
+    float sxyL = 0.0
+    for i = 0 to n - 1
+        float h  = s.hs.get(i)
+        float l  = s.ls.get(i)
+        bool  aT = h >= top - tol
+        bool  aB = l <= bot + tol
+        if aT and not wasT
+            tTop += 1
+        if aB and not wasB
+            tBot += 1
+        wasT := aT
+        wasB := aB
+        sx   += i
+        sxx  += i * i
+        syH  += h
+        syL  += l
+        sxyH += i * h
+        sxyL += i * l
+    float den    = n * sxx - sx * sx
+    float slopeH = den != 0 ? (n * sxyH - sx * syH) / den : 0.0
+    float slopeL = den != 0 ? (n * sxyL - sx * syL) / den : 0.0
+    // Most recent pivot on the stop side (left bars strictly beyond, right bars not beyond).
+    float swing = s.dir > 0 ? bot : top
+    int   jHi   = n - 1 - i_pivR
+    if jHi >= i_pivL
+        for j = jHi to i_pivL
+            float c  = s.dir > 0 ? s.ls.get(j) : s.hs.get(j)
+            bool  ok = true
+            for k = 1 to i_pivL
+                float o = s.dir > 0 ? s.ls.get(j - k) : s.hs.get(j - k)
+                if s.dir > 0 ? o <= c : o >= c
+                    ok := false
+            for k = 1 to i_pivR
+                float o = s.dir > 0 ? s.ls.get(j + k) : s.hs.get(j + k)
+                if s.dir > 0 ? o < c : o > c
+                    ok := false
+            if ok
+                swing := c
+                break
+    s.top    := top
+    s.bot    := bot
+    s.swing  := swing
+    s.tBk    := s.dir > 0 ? tTop : tBot
+    s.tFar   := s.dir > 0 ? tBot : tTop
+    s.driftH := math.abs(slopeH) * n
+    s.driftL := math.abs(slopeL) * n
+    s.valid  := n >= i_stopMin and n <= i_stopMax and s.tBk >= i_bkTouch and s.tFar >= i_farTouch and s.driftH <= tol and s.driftL <= tol
+    s
+
+// Bookkeeping when a setup dies without filling. Only setups that were "armed"
+// (valid while the entry window was open) count toward the skip statistics.
+method finish(Setup s, string reason) =>
+    if s.armed
+        string key = s.everOrd ? "Cancelled: " + reason : "Skipped: " + (s.block != "" ? s.block : reason)
+        skipMap.put(key, nz(skipMap.get(key)) + 1)
+        log.warning("{0} ({1}) {2}", s.oid, s.dir > 0 ? "long" : "short", key)
+        if i_showSkips
+            label.new(bar_index, s.dir > 0 ? s.bot : s.top, "", style = label.style_xcross, color = C_GREY, size = size.tiny, tooltip = s.oid + ": " + key)
+    if s.armed and i_keepCxl
+        if not na(s.goLine)
+            s.goLine.set_color(C_GREY)
+        if not na(s.stopBox)
+            s.stopBox.set_border_color(C_GREY)
+            s.stopBox.set_bgcolor(color.new(C_GREY, 90))
+    else
+        if not na(s.goLine)
+            s.goLine.delete()
+        if not na(s.stopBox)
+            s.stopBox.delete()
+    s
+
+// Freeze the working order's snapshot into a trade record at the moment it fills.
+f_newRec(Setup s) =>
+    int   d    = s.dir
+    float rp   = s.rPts
+    float legP = s.legHi - s.legLo
+    int   hz   = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), MFE_END_H, MFE_END_M)
+    if hz <= time
+        hz += DAY_MS
+    Rec.new(oid = s.oid, t = time, bar = bar_index, sess = sessNo, dir = d, mom = s.mom, gap = s.gap, mgmt = s.mgmt,
+         legPts = legP, legAtr = legP / s.atrRef, stopBars = s.nSnap, stopAtr = (s.topSnap - s.botSnap) / s.atrRef,
+         depth = (d > 0 ? s.legHi - s.botSnap : s.topSnap - s.legLo) / legP * 100.0,
+         entry = s.pxE, sl = s.pxS, riskPts = rp, qty = s.qty, t1 = s.t1, tEnd = s.tEnd,
+         tFull = math.round_to_mintick(s.pxE + d * i_tgtR * rp), tRun = math.round_to_mintick(s.pxE + d * i_runR * rp),
+         legHi = s.legHi, legLo = s.legLo, stopTop = s.topSnap, stopBot = s.botSnap, horizon = hz, best = s.pxE)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Research tracker: runs bar by bar from the entry bar, independent of how the
+// real position was managed, so every trade gets the same measurements.
+//   MFE / expansion   against the ORIGINAL stop, until it is hit or 23:59 ET
+//   shadow 2R         -1R at the stop, +target R at the target
+//   shadow 1R+BE      partial at partial-R, stop to entry from the NEXT bar
+//                     (as in live trading), runner to runner-R
+// Stop-first rule: if a bar contains the stop and a target, the stop wins and the
+// trade is flagged ambiguous. A stop inside the entry bar is also ambiguous.
+// ───────────────────────────────────────────────────────────────────────────────
+method track(Rec r, bool flatNow) =>
+    int   d     = r.dir
+    float p     = i_partPct / 100.0
+    bool  isEnt = r.bar == bar_index
+    bool  hitSL = d > 0 ? low <= r.sl : high >= r.sl
+    if isEnt and hitSL
+        r.ambiguous := true
+    if r.mfeOpen
+        if time >= r.horizon or hitSL
+            r.mfeOpen := false
+        else
+            r.best := d > 0 ? math.max(r.best, high) : math.min(r.best, low)
+        if not r.mfeOpen
+            r.mfeR      := (r.best - r.entry) * d / r.riskPts
+            r.expansion := (d > 0 ? r.best - r.stopBot : r.stopTop - r.best) / (r.legHi - r.legLo)
+    if na(r.sh2)
+        bool tg = d > 0 ? high >= r.tFull : low <= r.tFull
+        if hitSL
+            r.sh2 := -1.0
+            r.ambiguous := r.ambiguous or tg
+        else if tg
+            r.sh2 := i_tgtR
+    if na(r.shB)
+        bool tR = d > 0 ? high >= r.tRun : low <= r.tRun
+        if r.shBPhase == 0
+            bool t1 = d > 0 ? high >= r.t1 : low <= r.t1
+            if hitSL
+                r.shB := -1.0
+                r.ambiguous := r.ambiguous or t1
+            else if t1
+                if tR
+                    r.shB := p * i_partR + (1 - p) * i_runR
+                else
+                    r.shBPhase := 1
+        else
+            bool beHit = d > 0 ? low <= r.entry : high >= r.entry
+            if beHit
+                r.shB := p * i_partR
+                r.ambiguous := r.ambiguous or tR
+            else if tR
+                r.shB := p * i_partR + (1 - p) * i_runR
+    // With "Flatten at window end" the shadows are closed the same way the real
+    // position is: marked at the close of the last window bar (≈ the next open).
+    if flatNow
+        float mtm = (close - r.entry) * d / r.riskPts
+        if na(r.sh2)
+            r.sh2 := mtm
+        if na(r.shB)
+            r.shB := r.shBPhase == 1 ? p * i_partR + (1 - p) * mtm : mtm
+    r
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Stats helpers
+// ───────────────────────────────────────────────────────────────────────────────
+f_str(float x, string fmt) =>
+    na(x) ? "–" : str.tostring(x, fmt)
+
+f_r(float x) =>
+    na(x) ? "–" : (x >= 0 ? "+" : "") + str.tostring(x, "0.00")
+
+f_pct(float x) =>
+    na(x) ? "–" : str.tostring(x, "0.0") + "%"
+
+f_pctl(array<float> a, float p) =>
+    a.size() > 0 ? array.percentile_linear_interpolation(a, p) : na
+
+f_mean(array<float> a) =>
+    a.size() > 0 ? a.avg() : na
+
+f_win(array<float> a) =>
+    int w = 0
+    for x in a
+        if x > 0
+            w += 1
+    a.size() > 0 ? 100.0 * w / a.size() : na
+
+f_bucket(float dp) =>
+    dp < 25.0 ? 0 : dp < 38.2 ? 1 : dp < 50.0 ? 2 : dp < 61.8 ? 3 : 4
+
+f_bag() =>
+    Bag.new(array.new<float>(), array.new<float>(), array.new<float>())
+
+method addRec(Bag b, Rec x) =>
+    b.r.push(x.netR)
+    if not na(x.mfeR)
+        b.mfe.push(x.mfeR)
+    if not na(x.expansion)
+        b.ex.push(x.expansion)
+    b
+
+f_cell(table tb, int c, int r, string s, color bg) =>
+    table.cell(tb, c, r, s, text_color = C_TXT, bgcolor = bg, text_size = tblSize, text_halign = c == 0 ? text.align_left : text.align_right)
+
+f_bagRow(table tb, int row, string name, Bag b, color bg) =>
+    f_cell(tb, 0, row, name, bg)
+    f_cell(tb, 1, row, str.tostring(b.r.size()), bg)
+    f_cell(tb, 2, row, f_pct(f_win(b.r)), bg)
+    f_cell(tb, 3, row, f_r(f_mean(b.r)), bg)
+    f_cell(tb, 4, row, f_r(f_pctl(b.r, 50)), bg)
+    f_cell(tb, 5, row, f_str(f_mean(b.ex), "0.00"), bg)
+    f_cell(tb, 6, row, f_str(f_pctl(b.ex, 25), "0.00"), bg)
+    f_cell(tb, 7, row, f_str(f_pctl(b.ex, 50), "0.00"), bg)
+    f_cell(tb, 8, row, f_str(f_pctl(b.ex, 75), "0.00"), bg)
+    f_cell(tb, 9, row, f_str(f_mean(b.mfe), "0.00"), bg)
+    f_cell(tb, 10, row, f_str(f_pctl(b.mfe, 25), "0.00"), bg)
+    f_cell(tb, 11, row, f_str(f_pctl(b.mfe, 50), "0.00"), bg)
+    f_cell(tb, 12, row, f_str(f_pctl(b.mfe, 75), "0.00"), bg)
+    b
+
+f_mgmtRow(table tb, int row, string name, array<float> a, color bg) =>
+    f_cell(tb, 0, row, name, bg)
+    f_cell(tb, 1, row, str.tostring(a.size()), bg)
+    f_cell(tb, 2, row, f_pct(f_win(a)), bg)
+    f_cell(tb, 3, row, f_r(f_mean(a)), bg)
+    f_cell(tb, 4, row, f_r(f_pctl(a, 50)), bg)
+    f_cell(tb, 5, row, f_r(a.size() > 0 ? a.sum() : na), bg)
+    a
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1 · Context: timeframe guard, ATR, window flags, day-type range, gap, bias
+// ═══════════════════════════════════════════════════════════════════════════════
+bool  tfOK     = timeframe.isminutes and timeframe.multiplier == 1
+float atr      = ta.atr(i_atrLen)
+int   modNow   = f_mod(time)
+bool  winNow   = f_in(modNow, winS, winE)
+// Orders submitted on this close are working during the NEXT bar, so the window
+// test for order placement uses the next bar's open time (= this bar's close time).
+bool  winNext  = f_in(f_mod(time_close), winS, winE)
+bool  winOpen  = winNext and not winNext[1]
+bool  winClose = winNext[1] and not winNext
+bool  preNow   = f_in(modNow, preS, preE)
+
+// 18:00–20:00 range, built bar by bar and read once the window opens.
+if preNow
+    if not preNow[1] or na(preHi)
+        preHi    := high
+        preLo    := low
+        preStart := time
+    else
+        preHi := math.max(preHi, high)
+        preLo := math.min(preLo, low)
+
+// Sunday gap: first bar of the Sunday reopen vs. the last close before the weekend
+// (normally Friday 17:00 ET; close[1] also handles holiday-shortened Fridays).
+bool sundayOpen = bar_index > 0 and dayofweek(time, TZ) == dayofweek.sunday and dayofweek(time[1], TZ) != dayofweek.sunday
+if sundayOpen
+    // A new weekend replaces any previous gap, filled or not.
+    gapOn := false
+    if i_useGap
+        friClose := close[1]
+        float g = open - friClose
+        if math.abs(g) >= i_gapPts
+            gapOn   := true
+            gapDir  := g > 0 ? 1 : -1
+            gapSess := 0
+            log.info("Major Sunday gap {0} pts vs Friday close {1}", g, friClose)
+            if i_showGap
+                gapLn := line.new(bar_index, friClose, bar_index + 1, friClose, color = C_GAP, style = line.style_dashed, width = 1)
+if gapOn
+    if not na(gapLn)
+        gapLn.set_x2(bar_index)
+    // "Trades through Friday's close": the bar reaches the level.
+    if gapDir > 0 ? low <= friClose : high >= friClose
+        gapOn := false
+        log.info("Sunday gap filled at {0}", friClose)
+
+// Bias: last fully closed 15m bar's close vs its 50 EMA. expr[1] + lookahead_on is
+// the non-repainting idiom: identical values on historical and realtime bars.
+[htfC, htfE] = request.security(syminfo.tickerid, i_biasTf, [close[1], ta.ema(close, i_emaLen)[1]], lookahead = barmerge.lookahead_on)
+int emaBias = na(htfC) or na(htfE) ? 0 : htfC > htfE ? 1 : htfC < htfE ? -1 : 0
+// An unfilled major gap overrides the EMA and points toward the fill.
+int bias    = gapOn ? -gapDir : emaBias
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2 · What happened inside this bar: entry fill, exits, research trackers
+// Processed first, because the engine already executed this bar's orders before
+// the script runs on its close.
+// ═══════════════════════════════════════════════════════════════════════════════
+if not na(su) and su.live
+    bool filled = strategy.position_size != 0 and strategy.opentrades > 0 and strategy.opentrades.entry_id(0) == su.oid
+    if not filled and strategy.closedtrades > lastClosed
+        // Entry and full exit inside the same bar leave no open trade behind.
+        for i = lastClosed to strategy.closedtrades - 1
+            if strategy.closedtrades.entry_id(i) == su.oid
+                filled := true
+    if filled
+        act := f_newRec(su)
+        recs.push(act)
+        if recs.size() > i_maxRecs
+            recs.shift()
+        liveRecs.push(act)
+        sessTrades += 1
+        nTaken     += 1
+        if not na(su.stopBox)
+            su.stopBox.set_right(bar_index - 1)
+        if i_showLvls
+            int x2 = bar_index + 15
+            line.new(bar_index, act.entry, x2, act.entry, color = C_ENTRY, width = 1)
+            line.new(bar_index, act.sl, x2, act.sl, color = C_DN, width = 1)
+            line.new(bar_index, act.tEnd, x2, act.tEnd, color = C_TGT, width = 1)
+            if act.mgmt == 1
+                line.new(bar_index, act.t1, x2, act.t1, color = C_TGT, style = line.style_dotted, width = 1)
+        if i_showLbls
+            string tag = (act.dir > 0 ? "L" : "S") + " · d " + str.tostring(act.depth, "0") + "% · " + (act.mom ? "MOM" : "SAFE") + (act.gap ? " · GAP" : "")
+            act.lbl := label.new(bar_index, act.dir > 0 ? low : high, tag, style = act.dir > 0 ? label.style_label_up : label.style_label_down, color = act.dir > 0 ? C_UP : C_DN, textcolor = color.white, size = size.tiny)
+        log.info("FILL {0} {1} qty={2} entry={3} sl={4} risk={5}pts depth={6}%", act.oid, act.dir > 0 ? "long" : "short", act.qty, act.entry, act.sl, act.riskPts, act.depth)
+        su := na
+
+// Realised P&L of every closed (partial) trade belonging to the open record.
+if strategy.closedtrades > lastClosed
+    for i = lastClosed to strategy.closedtrades - 1
+        if not na(act) and strategy.closedtrades.entry_id(i) == act.oid
+            act.pnl := act.pnl + strategy.closedtrades.profit(i)
+    lastClosed := strategy.closedtrades
+
+if liveRecs.size() > 0
+    for i = liveRecs.size() - 1 to 0
+        Rec r = liveRecs.get(i)
+        r.track(i_flatten and winClose and r.sess == sessNo)
+        if not r.mfeOpen and not na(r.sh2) and not na(r.shB)
+            liveRecs.remove(i)
+
+// Position fully closed → final net R (after commission and slippage).
+if not na(act) and strategy.position_size == 0
+    act.netR := act.pnl / (act.riskPts * syminfo.pointvalue * act.qty)
+    if act.netR < 0 and act.sess == sessNo
+        sessLosses += 1
+    if not na(act.lbl)
+        act.lbl.set_text(act.lbl.get_text() + " · " + f_r(act.netR) + "R")
+    log.info("CLOSE {0} net R={1} pnl={2}", act.oid, act.netR, act.pnl)
+    act := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3 · Session open (close of the bar before the window): reset limits, classify day
+// ═══════════════════════════════════════════════════════════════════════════════
+if winOpen
+    sessNo     += 1
+    sessTrades := 0
+    sessLosses := 0
+    float rng  = not na(preHi) and time - preStart <= 4 * 3600000 ? preHi - preLo : na
+    // Use the average once at least 5 sessions (or the full lookback, if shorter) exist.
+    float avgR = preRanges.size() >= math.min(5, i_momLook) ? preRanges.avg() : na
+    sessMom := gapOn or (not na(rng) and not na(avgR) and rng >= i_momMult * avgR)
+    if not na(rng)
+        preRanges.push(rng)
+        if preRanges.size() > i_momLook
+            preRanges.shift()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 4 · Manage the open position: stop to breakeven once partial-R has traded
+// (checked on close, so the new stop is working from the next bar onward)
+// ═══════════════════════════════════════════════════════════════════════════════
+if not na(act) and strategy.position_size != 0 and act.mgmt == 1 and not act.beDone
+    if act.dir > 0 ? high >= act.t1 : low <= act.t1
+        act.beDone := true
+        strategy.exit(act.oid + "-X", act.oid, limit = act.tEnd, stop = strategy.position_avg_price, comment_profit = "TP2", comment_loss = "BE")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 5 · Pattern state machine
+// ═══════════════════════════════════════════════════════════════════════════════
+Leg upDone = legUp.upd(atr[1])
+Leg dnDone = legDn.upd(atr[1])
+
+// 5a · Advance the current setup. Breaks are judged against the STOP as it stood
+// before this bar; only then is the bar added to the STOP.
+string dead = ""
+if not na(su)
+    float tk       = syminfo.mintick
+    bool  farBreak = su.dir > 0 ? low < su.bot : high > su.top
+    bool  outBreak = su.dir > 0 ? high >= su.top + i_entTicks * tk : low <= su.bot - i_entTicks * tk
+    bool  legBreak = su.dir > 0 ? low < su.legLo : high > su.legHi
+    if su.dir != bias
+        dead := "Bias flipped"
+    else if su.valid and farBreak
+        dead := su.dir > 0 ? "STOP low broken" : "STOP high broken"
+    else if su.valid and outBreak
+        dead := "Broke out with no working order"
+    else if legBreak
+        dead := "Retraced through GO leg start"
+    else
+        su.hs.push(high)
+        su.ls.push(low)
+        su.evalStop()
+        if su.hs.size() > i_stopMax
+            dead := "STOP exceeded max bars"
+        else if not na(su.stopBox)
+            su.stopBox.set_right(bar_index)
+            su.stopBox.set_top(su.top)
+            su.stopBox.set_bottom(su.bot)
+if dead != ""
+    if su.live
+        strategy.cancel(su.oid)
+        strategy.cancel(su.oid + "-T1")
+        strategy.cancel(su.oid + "-X")
+    su.finish(dead)
+    su := na
+
+// 5b · A newly completed GO leg in the bias direction starts a setup. This bar is
+// STOP bar 1. A setup with a working order is never replaced (one pending at a time).
+Leg g = bias > 0 ? upDone : bias < 0 ? dnDone : na
+if tfOK and not na(g) and strategy.position_size == 0 and na(act) and (na(su) or not su.live)
+    if g.dir > 0 ? low >= g.lo : high <= g.hi
+        if not na(su)
+            su.finish("Replaced by newer GO leg")
+            su := na
+        oidSeq += 1
+        su := Setup.new(dir = g.dir, oid = (g.dir > 0 ? "L" : "S") + str.tostring(oidSeq), legStart = g.startBar, legEnd = g.endBar, legHi = g.hi, legLo = g.lo, atrRef = g.atrRef, stopStart = bar_index, hs = array.new<float>(), ls = array.new<float>())
+        su.hs.push(high)
+        su.ls.push(low)
+        su.evalStop()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 6 · Window end: cancel anything unfilled, optionally flatten
+// ═══════════════════════════════════════════════════════════════════════════════
+if winClose
+    if not na(su)
+        if su.live
+            strategy.cancel(su.oid)
+            strategy.cancel(su.oid + "-T1")
+            strategy.cancel(su.oid + "-X")
+        su.finish("Entry window ended")
+        su := na
+    if i_flatten and strategy.position_size != 0
+        strategy.close_all(comment = "Window end")
+    if gapOn and i_gapExpire > 0
+        gapSess += 1
+        if gapSess >= i_gapExpire
+            gapOn := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 7 · Orders. A valid STOP inside the window gets (or keeps) a stop-entry order
+// with its bracket. The order is re-submitted every bar so price, stop and size
+// track the latest STOP. If the STOP stops qualifying the order is pulled until
+// it qualifies again.
+// ═══════════════════════════════════════════════════════════════════════════════
+if not na(su)
+    bool   want    = false
+    bool   limitHt = false
+    string why     = ""
+    float  pxE     = na
+    float  pxS     = na
+    float  rPts    = na
+    int    qty     = 0
+    if su.valid and winNext and tfOK and strategy.position_size == 0
+        if not su.armed
+            su.armed := true
+            nArmed   += 1
+            if i_showLeg
+                su.goLine := line.new(su.legStart, su.dir > 0 ? su.legLo : su.legHi, su.legEnd, su.dir > 0 ? su.legHi : su.legLo, color = su.dir > 0 ? C_UP : C_DN, width = 2)
+            if i_showStop
+                su.stopBox := box.new(su.stopStart, su.top, bar_index, su.bot, border_color = su.dir > 0 ? C_UP : C_DN, bgcolor = color.new(su.dir > 0 ? C_UP : C_DN, 88))
+        if sessTrades >= i_maxTrades
+            why     := "Limit hit (max trades)"
+            limitHt := true
+        else if sessLosses >= i_maxLosses
+            why     := "Limit hit (losses)"
+            limitHt := true
+        else
+            float tk = syminfo.mintick
+            pxE  := su.dir > 0 ? su.top + i_entTicks * tk : su.bot - i_entTicks * tk
+            pxS  := su.dir > 0 ? su.swing - i_slTicks * tk : su.swing + i_slTicks * tk
+            rPts := math.abs(pxE - pxS)
+            // Contracts = floor(risk budget / risk per contract), minimum 1; skip if
+            // even one contract would risk more than the cap × budget.
+            float budget = strategy.equity * i_riskPct / 100.0
+            float perC   = rPts * syminfo.pointvalue
+            qty := perC > 0 ? math.max(1, math.floor(budget / perC)) : 0
+            if i_maxQty > 0
+                qty := math.min(qty, i_maxQty)
+            if perC <= 0 or perC > i_riskCap * budget
+                why := "Size too large"
+            else
+                want := true
+    if want
+        int   d    = su.dir
+        int   mg   = i_mgmt == "Always 2R" ? 0 : i_mgmt == "Always 1R+BE" ? 1 : sessMom ? 0 : 1
+        float t1   = math.round_to_mintick(pxE + d * i_partR * rPts)
+        float tF   = math.round_to_mintick(pxE + d * i_tgtR * rPts)
+        float tR   = math.round_to_mintick(pxE + d * i_runR * rPts)
+        float tEnd = mg == 0 ? tF : tR
+        strategy.entry(su.oid, d > 0 ? strategy.long : strategy.short, qty = qty, stop = pxE, comment = su.oid)
+        // Bracket is attached before the fill so it protects the entry bar too.
+        // Partial: the first exit reserves partial% of the position (qty_percent);
+        // the second exit covers the remainder. With 1 contract a partial would
+        // round to 0, so the whole position rides to the runner target and the
+        // stop still moves to breakeven after partial-R trades (section 4).
+        if mg == 1 and qty >= 2
+            strategy.exit(su.oid + "-T1", su.oid, qty_percent = i_partPct, limit = t1, stop = pxS, comment_profit = "TP1", comment_loss = "SL")
+        else
+            strategy.cancel(su.oid + "-T1")
+        strategy.exit(su.oid + "-X", su.oid, limit = tEnd, stop = pxS, comment_profit = mg == 0 ? "TP" : "TP2", comment_loss = "SL")
+        su.live    := true
+        su.everOrd := true
+        su.pxE     := pxE
+        su.pxS     := pxS
+        su.rPts    := rPts
+        su.qty     := qty
+        su.mgmt    := mg
+        su.t1      := t1
+        su.tEnd    := tEnd
+        su.mom     := sessMom
+        su.gap     := gapOn
+        su.nSnap   := su.hs.size()
+        su.topSnap := su.top
+        su.botSnap := su.bot
+    else if su.live
+        strategy.cancel(su.oid)
+        strategy.cancel(su.oid + "-T1")
+        strategy.cancel(su.oid + "-X")
+        su.live := false
+    if why != ""
+        su.block := why
+    if limitHt
+        su.finish(why)
+        su := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 8 · Visuals
+// ═══════════════════════════════════════════════════════════════════════════════
+bgcolor(i_showWin and winNow ? color.new(C_GREY, 90) : na, title = "Entry window")
+bgcolor(i_showGap and gapOn ? color.new(C_GAP, 90) : na, title = "Gap mode")
+plot(i_showEma ? htfE : na, "Bias EMA (last closed 15m)", color = color.purple, style = plot.style_stepline)
+plot(bias, "Bias (+1 long / -1 short / 0 none)", display = display.data_window)
+plot(atr, "ATR (1m)", display = display.data_window)
+plot(gapOn ? friClose : na, "Gap: Friday close", display = display.data_window)
+plot(not na(su) ? su.driftH : na, "STOP drift highs (pts)", display = display.data_window)
+plot(not na(su) ? su.driftL : na, "STOP drift lows (pts)", display = display.data_window)
+plot(not na(su) ? i_k * su.atrRef : na, "STOP tolerance k×ATR (pts)", display = display.data_window)
+
+var label warnLbl = na
+if not tfOK and barstate.islast
+    if not na(warnLbl)
+        warnLbl.delete()
+    warnLbl := label.new(bar_index, high, "Go-Stop-Go needs a 1-minute chart.\nChart is " + timeframe.period + ": no trades are taken.", style = label.style_label_down, color = C_DN, textcolor = color.white, size = size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 9 · Research statistics (built once, on the last bar)
+// Win = net R > 0, loss = net R < 0. Medians are shown next to means everywhere
+// because expansion and MFE are right-skewed.
+// ═══════════════════════════════════════════════════════════════════════════════
+var table tStats = na
+if barstate.islast and i_showTable
+    if not na(tStats)
+        tStats.delete()
+    tStats := table.new(position.top_right, 13, 44, bgcolor = C_ROW, border_color = C_HEAD, border_width = 1, frame_color = C_HEAD, frame_width = 1)
+
+    Bag all = f_bag()
+    array<Bag> dep = array.new<Bag>()
+    for b = 0 to 4
+        dep.push(f_bag())
+    Bag bMom  = f_bag()
+    Bag bSafe = f_bag()
+    Bag bGap  = f_bag()
+    Bag bNoG  = f_bag()
+    Bag bLong = f_bag()
+    Bag bShrt = f_bag()
+    array<float> mAct  = array.new<float>()
+    array<float> mAuto = array.new<float>()
+    array<float> m2R   = array.new<float>()
+    array<float> mBE   = array.new<float>()
+    int amb     = 0
+    int pending = 0
+    for x in recs
+        if na(x.netR)
+            pending += 1
+        else
+            all.addRec(x)
+            dep.get(f_bucket(x.depth)).addRec(x)
+            if x.mom
+                bMom.addRec(x)
+            else
+                bSafe.addRec(x)
+            if x.gap
+                bGap.addRec(x)
+            else
+                bNoG.addRec(x)
+            if x.dir > 0
+                bLong.addRec(x)
+            else
+                bShrt.addRec(x)
+            if x.ambiguous
+                amb += 1
+            if not na(x.sh2) and not na(x.shB)
+                mAct.push(x.netR)
+                mAuto.push(x.mgmt == 1 ? x.shB : x.sh2)
+                m2R.push(x.sh2)
+                mBE.push(x.shB)
+
+    // Overall: chronological pass for drawdown and streaks.
+    int   n     = all.r.size()
+    int   nW    = 0
+    int   nL    = 0
+    float sumW  = 0.0
+    float sumL  = 0.0
+    float cum   = 0.0
+    float peak  = 0.0
+    float mdd   = 0.0
+    int   strk  = 0
+    int   maxSt = 0
+    for x in all.r
+        cum  += x
+        peak := math.max(peak, cum)
+        mdd  := math.max(mdd, peak - cum)
+        if x > 0
+            nW   += 1
+            sumW += x
+        if x < 0
+            nL    += 1
+            sumL  += x
+            strk  += 1
+            maxSt := math.max(maxSt, strk)
+        else
+            strk := 0
+    float avgW   = nW > 0 ? sumW / nW : na
+    float avgL   = nL > 0 ? sumL / nL : na
+    float expect = n > 0 ? (nW * nz(avgW) + nL * nz(avgL)) / n : na
+    string pf    = nL > 0 ? str.tostring(sumW / -sumL, "0.00") : nW > 0 ? "∞" : "–"
+
+    int row = 0
+    tStats.cell(0, row, "Go-Stop-Go research · " + syminfo.ticker + " · trades " + str.tostring(n) + (pending > 0 ? " (+" + str.tostring(pending) + " open)" : "") + " · setups armed " + str.tostring(nArmed), text_color = C_TXT, bgcolor = C_HEAD, text_size = tblSize, text_halign = text.align_left)
+    tStats.merge_cells(0, row, 12, row)
+    row += 1
+    array<string> hOv = array.from("Overall", "Trades", "Win%", "Avg R", "Med R", "Expect.", "PF", "Max DD R", "Max L strk", "Avg win", "Avg loss", "Total R", "Ambig.")
+    for c = 0 to 12
+        f_cell(tStats, c, row, hOv.get(c), C_HEAD)
+    row += 1
+    f_cell(tStats, 0, row, "Net R (actual)", C_ROW)
+    f_cell(tStats, 1, row, str.tostring(n), C_ROW)
+    f_cell(tStats, 2, row, f_pct(n > 0 ? 100.0 * nW / n : na), C_ROW)
+    f_cell(tStats, 3, row, f_r(f_mean(all.r)), C_ROW)
+    f_cell(tStats, 4, row, f_r(f_pctl(all.r, 50)), C_ROW)
+    f_cell(tStats, 5, row, f_r(expect), C_ROW)
+    f_cell(tStats, 6, row, pf, C_ROW)
+    f_cell(tStats, 7, row, f_str(n > 0 ? mdd : na, "0.00"), C_ROW)
+    f_cell(tStats, 8, row, str.tostring(maxSt), C_ROW)
+    f_cell(tStats, 9, row, f_r(avgW), C_ROW)
+    f_cell(tStats, 10, row, f_r(avgL), C_ROW)
+    f_cell(tStats, 11, row, f_r(n > 0 ? cum : na), C_ROW)
+    f_cell(tStats, 12, row, str.tostring(amb), C_ROW)
+    row += 1
+
+    array<string> hBag = array.from("Group", "N", "Win%", "Avg R", "Med R", "Exp avg", "Exp P25", "Exp P50", "Exp P75", "MFE avg", "MFE P25", "MFE P50", "MFE P75")
+    for c = 0 to 12
+        f_cell(tStats, c, row, hBag.get(c), C_HEAD)
+    row += 1
+    f_bagRow(tStats, row, "All trades", all, C_ROW)
+    row += 1
+    array<string> dNames = array.from("Depth < 25%", "Depth 25–38.2%", "Depth 38.2–50%", "Depth 50–61.8%", "Depth > 61.8%")
+    for b = 0 to 4
+        f_bagRow(tStats, row, dNames.get(b), dep.get(b), b % 2 == 0 ? C_ROW2 : C_ROW)
+        row += 1
+    f_bagRow(tStats, row, "Momentum day", bMom, C_ROW)
+    row += 1
+    f_bagRow(tStats, row, "Safe day", bSafe, C_ROW)
+    row += 1
+    f_bagRow(tStats, row, "Gap mode", bGap, C_ROW2)
+    row += 1
+    f_bagRow(tStats, row, "No gap", bNoG, C_ROW2)
+    row += 1
+    f_bagRow(tStats, row, "Longs", bLong, C_ROW)
+    row += 1
+    f_bagRow(tStats, row, "Shorts", bShrt, C_ROW)
+    row += 1
+
+    array<string> hM = array.from("Management (same trades)", "N", "Win%", "Avg R", "Med R", "Total R")
+    for c = 0 to 5
+        f_cell(tStats, c, row, hM.get(c), C_HEAD)
+    tStats.cell(6, row, "sims: stop-first, no costs · actual: engine fills, net of costs", text_color = C_TXT, bgcolor = C_HEAD, text_size = tblSize, text_halign = text.align_left)
+    tStats.merge_cells(6, row, 12, row)
+    row += 1
+    f_mgmtRow(tStats, row, "Actual (net)", mAct, C_ROW2)
+    row += 1
+    f_mgmtRow(tStats, row, "Auto (sim)", mAuto, C_ROW)
+    row += 1
+    f_mgmtRow(tStats, row, "Always " + str.tostring(i_tgtR) + "R (sim)", m2R, C_ROW)
+    row += 1
+    f_mgmtRow(tStats, row, "Always " + str.tostring(i_partR) + "R+BE (sim)", mBE, C_ROW)
+    row += 1
+
+    array<string> ks = skipMap.keys()
+    int skTot = 0
+    for k in ks
+        skTot += skipMap.get(k)
+    tStats.cell(0, row, "Setups armed " + str.tostring(nArmed) + " · taken " + str.tostring(nTaken) + " · skipped / cancelled " + str.tostring(skTot), text_color = C_TXT, bgcolor = C_HEAD, text_size = tblSize, text_halign = text.align_left)
+    tStats.merge_cells(0, row, 12, row)
+    row += 1
+    for k in ks
+        if row < 44
+            tStats.cell(0, row, k, text_color = C_TXT, bgcolor = C_ROW, text_size = tblSize, text_halign = text.align_left)
+            tStats.merge_cells(0, row, 3, row)
+            f_cell(tStats, 4, row, str.tostring(skipMap.get(k)), C_ROW)
+            row += 1
+
+// Optional per-trade log, newest first: the quickest way to audit individual rows.
+var table tLog = na
+if barstate.islast and i_showLog
+    if not na(tLog)
+        tLog.delete()
+    tLog := table.new(position.bottom_right, 16, i_logRows + 1, bgcolor = C_ROW, border_color = C_HEAD, border_width = 1)
+    array<string> hL = array.from("Date (ET)", "Dir", "Day", "Gap", "Leg ATR", "STOP bars", "STOP ATR", "Depth%", "Risk pts", "Qty", "Net R", "MFE R", "Expan.", "2R sim", "BE sim", "Ambig.")
+    for c = 0 to 15
+        f_cell(tLog, c, 0, hL.get(c), C_HEAD)
+    int row = 1
+    if recs.size() > 0
+        for i = recs.size() - 1 to 0
+            if row > i_logRows
+                break
+            Rec x = recs.get(i)
+            color bg = row % 2 == 0 ? C_ROW2 : C_ROW
+            f_cell(tLog, 0, row, str.format_time(x.t, "yy-MM-dd HH:mm", TZ), bg)
+            f_cell(tLog, 1, row, x.dir > 0 ? "L" : "S", bg)
+            f_cell(tLog, 2, row, x.mom ? "MOM" : "SAFE", bg)
+            f_cell(tLog, 3, row, x.gap ? "yes" : "no", bg)
+            f_cell(tLog, 4, row, f_str(x.legAtr, "0.0"), bg)
+            f_cell(tLog, 5, row, str.tostring(x.stopBars), bg)
+            f_cell(tLog, 6, row, f_str(x.stopAtr, "0.00"), bg)
+            f_cell(tLog, 7, row, f_str(x.depth, "0.0"), bg)
+            f_cell(tLog, 8, row, f_str(x.riskPts, "0.00"), bg)
+            f_cell(tLog, 9, row, str.tostring(x.qty), bg)
+            f_cell(tLog, 10, row, f_r(x.netR), bg)
+            f_cell(tLog, 11, row, f_str(x.mfeR, "0.00"), bg)
+            f_cell(tLog, 12, row, f_str(x.expansion, "0.00"), bg)
+            f_cell(tLog, 13, row, f_r(x.sh2), bg)
+            f_cell(tLog, 14, row, f_r(x.shB), bg)
+            f_cell(tLog, 15, row, x.ambiguous ? "yes" : "", bg)
+            row += 1
