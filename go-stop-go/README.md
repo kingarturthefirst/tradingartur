@@ -100,6 +100,8 @@ All decisions are made on bar close. An order submitted on the close of bar *t* 
 | Flatness tolerance k (× ATR) | 0.25 | Both the touch band and the maximum regression drift. |
 | Min touches of breakout level | 2 | Top for longs, bottom for shorts. |
 | Min touches of opposite level | 1 | 1 = no filter. |
+| STOP tolerance uses ATR of | Pre-leg | Pre-leg = ATR of the bar before the GO leg (strict). Current bar = live ATR(14), usually inflated by the impulse (looser). |
+| STOP starts on | Leg-ending bar | Leg-ending bar = the first bar that failed to make a new extreme is STOP bar 1. "Bar after leg ends" leaves it out; its high is usually near the leg high, so leaving it out helps sagging pauses pass the drift test. |
 
 ### Entry
 | Input | Default | What it does |
@@ -123,7 +125,7 @@ All decisions are made on bar close. An order submitted on the close of bar *t* 
 Each group can be turned on or off: window shading, gap tint and Friday-close line, GO leg line, STOP box, entry/stop/target lines, trade labels (direction · depth % · day type · gap · final R), skip markers (an ✕ whose tooltip gives the reason), and whether to keep drawings of cancelled setups.
 
 ### Stats
-Stats table on/off and its text size, an optional trade log table (bottom-right, newest first), how many rows the log shows, and a cap on how many trades the stats arrays keep.
+Stats table on/off and its text size, the diagnostics funnel (bottom-left, on by default), an optional trade log table (bottom-right, newest first), how many rows the log shows, and a cap on how many trades the stats arrays keep.
 
 ## Reading the stats table (top-right)
 
@@ -133,6 +135,28 @@ Stats table on/off and its text size, an optional trade log table (bottom-right,
 - **Skips.** Setups armed, setups taken, and every non-taken armed setup by reason. Examples: `Skipped: Size too large`, `Skipped: Limit hit (losses)`, `Cancelled: STOP low broken`, `Cancelled: Bias flipped`, `Cancelled: Entry window ended`.
 
 Each fill, close and skip is also written to **Pine Logs**, with the setup ID that appears as the order comment in the List of Trades.
+
+## Too few trades? Read the diagnostics funnel
+
+The bottom-left table counts every GO leg that ended between (window start − max STOP bars) and the window end, then shows how many survive each stage and which filter removed the rest:
+
+```
+GO legs ≥ X×ATR → ✕ same-direction candles / ✕ body ratio → valid GO legs → in bias direction
+→ setups started → never a valid STOP (✕ touches, ✕ highs drift, ✕ lows drift, death reasons)
+→ valid STOP → armed in window → order placed → filled
+```
+
+What to change depends on where the count collapses:
+
+| Collapses at | Likely cause | What to try |
+|---|---|---|
+| The title says only ~10 sessions | TradingView only loads about 2–3 weeks of 1m history without Deep Backtesting | Use Deep Backtesting, or judge the filters only by the funnel ratios |
+| GO legs ≥ X×ATR | Legs too small | `Min leg size` 2.0 |
+| ✕ body ratio or ✕ same-direction candles | 1m candles are wickier than the 60 % / 3-candle defaults | `Min average body / range` 50, `Min same-direction candles` 2 |
+| ✕ highs drift / ✕ lows drift | k × pre-leg ATR is only about 1–2 NQ points | `STOP tolerance uses ATR of` = Current bar, `STOP starts on` = Bar after leg ends, or `k` 0.4–0.5 |
+| ✕ breakout level touched | Breakouts often come after a single touch | `Min touches of breakout level` 1 (for comparison only) |
+| died: Bias flipped | The 15m bias flips while the STOP is forming | Expected; leave it |
+| armed → order placed | Size or limit skips | Check the Skips section of the stats table. On NQ with a small account, "Size too large" dominates: switch to MNQ or raise the cap |
 
 ## Validation checklist: confirm these on the chart before trusting any statistic
 

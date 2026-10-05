@@ -114,6 +114,8 @@ i_stopMax   = input.int(30, "Max STOP bars", minval = 3, maxval = 200, group = G
 i_k         = input.float(0.25, "Flatness tolerance k (× ATR)", minval = 0.01, step = 0.05, group = G_STOP, tooltip = "Touch band width AND the maximum regression drift (slope × bars) of the STOP highs and of the STOP lows.")
 i_bkTouch   = input.int(2, "Min touches of breakout level", minval = 1, group = G_STOP, tooltip = "Top for longs, bottom for shorts. A touch is a separate visit to the band within k × ATR of the level.")
 i_farTouch  = input.int(1, "Min touches of opposite level", minval = 1, group = G_STOP, tooltip = "1 = no extra filter (spec only requires the breakout level to be touched twice).")
+i_stopAtr   = input.string("Pre-leg", "STOP tolerance uses ATR of", options = ["Pre-leg", "Current bar"], group = G_STOP, tooltip = "Pre-leg: ATR of the bar before the GO leg (strict; the quiet market before the impulse). Current bar: live ATR(14), which the impulse has usually inflated (looser).")
+i_stopFrom  = input.string("Leg-ending bar", "STOP starts on", options = ["Leg-ending bar", "Bar after leg ends"], group = G_STOP, tooltip = "Leg-ending bar: the first bar that failed to make a new extreme is STOP bar 1. Its high usually sits near the leg high, which makes a sagging pullback fail the drift test. 'Bar after' excludes it.")
 
 i_entTicks  = input.int(1, "Entry offset beyond STOP (ticks)", minval = 0, group = G_ENTRY)
 i_slTicks   = input.int(1, "Stop-loss offset beyond swing (ticks)", minval = 0, group = G_ENTRY)
@@ -139,6 +141,7 @@ i_keepCxl   = input.bool(false, "Keep drawings of cancelled setups", group = G_V
 
 i_showTable = input.bool(true, "Show stats table", group = G_STATS)
 i_tblSize   = input.string("Tiny", "Table text size", options = ["Tiny", "Small", "Normal"], group = G_STATS)
+i_showDiag  = input.bool(true, "Show diagnostics funnel", group = G_STATS, tooltip = "Bottom-left table: how many GO legs / STOPs reached each stage and which filter removed the rest.")
 i_showLog   = input.bool(false, "Show trade log table", group = G_STATS)
 i_logRows   = input.int(12, "Trade log rows", minval = 1, maxval = 40, group = G_STATS)
 i_maxRecs   = input.int(3000, "Max trades kept in stats arrays", minval = 50, maxval = 20000, group = G_STATS)
@@ -218,6 +221,13 @@ type Setup
     int          nSnap
     float        topSnap
     float        botSnap
+    bool         inScope   = false
+    bool         everValid = false
+    bool         reachMin  = false
+    bool         fBk       = false
+    bool         fFar      = false
+    bool         fDH       = false
+    bool         fDL       = false
 
 // One taken trade: what it looked like, what it did, and what it could have done.
 type Rec
@@ -276,6 +286,8 @@ var Rec         act       = na                       // the trade currently open
 var array<Rec>  recs      = array.new<Rec>()         // every taken trade (capped)
 var array<Rec>  liveRecs  = array.new<Rec>()         // trades whose research tracker is still running
 var map<string, int> skipMap = map.new<string, int>()
+var map<string, int> diag    = map.new<string, int>()   // diagnostics funnel counters
+var int         firstTime  = time
 var int         lastClosed = 0
 var int         oidSeq     = 0
 var int         nArmed     = 0
@@ -296,6 +308,9 @@ var int   gapDir   = 0
 var int   gapSess  = 0
 var line  gapLn    = na
 
+f_inc(string key) =>
+    diag.put(key, nz(diag.get(key)) + 1)
+
 // ───────────────────────────────────────────────────────────────────────────────
 // GO leg detection
 // A leg is a run of bars that each make a new extreme in its direction. It ends on
@@ -303,8 +318,9 @@ var line  gapLn    = na
 // becomes STOP bar 1. Validation uses the ATR of the bar *before* the leg began,
 // so the leg is judged against the price action it is supposed to stand out from.
 // Returns a copy of the completed leg when it qualifies, otherwise na.
+// `count` feeds the diagnostics funnel (only legs ending in/near the window).
 // ───────────────────────────────────────────────────────────────────────────────
-method upd(Leg this, float atrPrev) =>
+method upd(Leg this, float atrPrev, bool count) =>
     float rng     = high - low
     float body    = math.abs(close - open)
     float bodyPct = rng > 0 ? body / rng * 100.0 : 0.0
@@ -328,6 +344,14 @@ method upd(Leg this, float atrPrev) =>
             bool solid     = this.bodySum / this.nBars >= i_legBody
             if bigEnough and enough and solid
                 done := this.copy()
+            if count and bigEnough
+                f_inc("leg.big")
+                if not enough
+                    f_inc("leg.failSame")
+                if not solid
+                    f_inc("leg.failBody")
+                if enough and solid
+                    f_inc("leg.valid")
             this.active := false
     // A new candidate can only start on a same-direction candle.
     if not this.active and same and not na(atrPrev) and atrPrev > 0
@@ -354,11 +378,11 @@ method upd(Leg this, float atrPrev) =>
 //   swing            most recent pivot low (long) / high (short) inside the
 //                    STOP, falling back to the STOP extreme. The stop goes beyond it.
 // ───────────────────────────────────────────────────────────────────────────────
-method evalStop(Setup s) =>
+method evalStop(Setup s, float atrNow) =>
     int   n    = s.hs.size()
     float top  = s.hs.max()
     float bot  = s.ls.min()
-    float tol  = i_k * s.atrRef
+    float tol  = i_k * (i_stopAtr == "Current bar" and not na(atrNow) ? atrNow : s.atrRef)
     int   tTop = 0
     int   tBot = 0
     bool  wasT = false
@@ -415,11 +439,36 @@ method evalStop(Setup s) =>
     s.driftH := math.abs(slopeH) * n
     s.driftL := math.abs(slopeL) * n
     s.valid  := n >= i_stopMin and n <= i_stopMax and s.tBk >= i_bkTouch and s.tFar >= i_farTouch and s.driftH <= tol and s.driftL <= tol
+    // Diagnostics: which checks were failing on the latest bar that had enough bars.
+    if n >= i_stopMin and n <= i_stopMax
+        s.reachMin := true
+        s.fBk      := s.tBk < i_bkTouch
+        s.fFar     := s.tFar < i_farTouch
+        s.fDH      := s.driftH > tol
+        s.fDL      := s.driftL > tol
+    if s.valid and not s.everValid
+        s.everValid := true
+        if s.inScope
+            f_inc("stop.valid")
     s
 
 // Bookkeeping when a setup dies without filling. Only setups that were "armed"
 // (valid while the entry window was open) count toward the skip statistics.
 method finish(Setup s, string reason) =>
+    if s.inScope and not s.everValid
+        f_inc("stop.never")
+        f_inc("die:" + reason)
+        if not s.reachMin
+            f_inc("stop.short")
+        else
+            if s.fBk
+                f_inc("stop.fBk")
+            if s.fFar
+                f_inc("stop.fFar")
+            if s.fDH
+                f_inc("stop.fDH")
+            if s.fDL
+                f_inc("stop.fDL")
     if s.armed
         string key = s.everOrd ? "Cancelled: " + reason : "Skipped: " + (s.block != "" ? s.block : reason)
         skipMap.put(key, nz(skipMap.get(key)) + 1)
@@ -595,6 +644,9 @@ bool  winNext  = f_in(f_mod(time_close), winS, winE)
 bool  winOpen  = winNext and not winNext[1]
 bool  winClose = winNext[1] and not winNext
 bool  preNow   = f_in(modNow, preS, preE)
+// Diagnostics scope: legs ending from (window start − max STOP bars) to window end,
+// i.e. the only legs whose STOP could still be alive when an order is allowed.
+bool  legScope = f_in(modNow, (winS - i_stopMax + 1440) % 1440, winE)
 
 // 18:00–20:00 range, built bar by bar and read once the window opens.
 if preNow
@@ -716,16 +768,23 @@ if winOpen
 // 4 · Manage the open position: stop to breakeven once partial-R has traded
 // (checked on close, so the new stop is working from the next bar onward)
 // ═══════════════════════════════════════════════════════════════════════════════
-if not na(act) and strategy.position_size != 0 and act.mgmt == 1 and not act.beDone
-    if act.dir > 0 ? high >= act.t1 : low <= act.t1
+// The bracket is also re-sent every bar while the position is open. TradingView
+// keeps exits that were attached before the fill, but re-sending them is
+// idempotent and guarantees the position can never be left without a stop/target.
+if not na(act) and strategy.position_size != 0
+    if act.mgmt == 1 and not act.beDone and (act.dir > 0 ? high >= act.t1 : low <= act.t1)
         act.beDone := true
-        strategy.exit(act.oid + "-X", act.oid, limit = act.tEnd, stop = strategy.position_avg_price, comment_profit = "TP2", comment_loss = "BE")
+    float curStop = act.beDone ? strategy.position_avg_price : act.sl
+    // The partial exit only exists while the full size is still on.
+    if act.mgmt == 1 and act.qty >= 2 and math.abs(strategy.position_size) >= act.qty
+        strategy.exit(act.oid + "-T1", act.oid, qty_percent = i_partPct, limit = act.t1, stop = curStop, comment_profit = "TP1", comment_loss = act.beDone ? "BE" : "SL")
+    strategy.exit(act.oid + "-X", act.oid, limit = act.tEnd, stop = curStop, comment_profit = act.mgmt == 0 ? "TP" : "TP2", comment_loss = act.beDone ? "BE" : "SL")
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 5 · Pattern state machine
 // ═══════════════════════════════════════════════════════════════════════════════
-Leg upDone = legUp.upd(atr[1])
-Leg dnDone = legDn.upd(atr[1])
+Leg upDone = legUp.upd(atr[1], legScope)
+Leg dnDone = legDn.upd(atr[1], legScope)
 
 // 5a · Advance the current setup. Breaks are judged against the STOP as it stood
 // before this bar; only then is the bar added to the STOP.
@@ -746,7 +805,7 @@ if not na(su)
     else
         su.hs.push(high)
         su.ls.push(low)
-        su.evalStop()
+        su.evalStop(atr)
         if su.hs.size() > i_stopMax
             dead := "STOP exceeded max bars"
         else if not na(su.stopBox)
@@ -761,19 +820,30 @@ if dead != ""
     su.finish(dead)
     su := na
 
-// 5b · A newly completed GO leg in the bias direction starts a setup. This bar is
-// STOP bar 1. A setup with a working order is never replaced (one pending at a time).
+// 5b · A newly completed GO leg in the bias direction starts a setup. By default
+// this bar is STOP bar 1. A setup with a working order is never replaced (one
+// pending at a time), and no setup starts while a position is open.
 Leg g = bias > 0 ? upDone : bias < 0 ? dnDone : na
+if legScope and not na(g)
+    f_inc("leg.bias")
+    if strategy.position_size != 0 or not na(act)
+        f_inc("leg.inPos")
+    else if not na(su) and su.live
+        f_inc("leg.pending")
 if tfOK and not na(g) and strategy.position_size == 0 and na(act) and (na(su) or not su.live)
     if g.dir > 0 ? low >= g.lo : high <= g.hi
         if not na(su)
             su.finish("Replaced by newer GO leg")
             su := na
         oidSeq += 1
-        su := Setup.new(dir = g.dir, oid = (g.dir > 0 ? "L" : "S") + str.tostring(oidSeq), legStart = g.startBar, legEnd = g.endBar, legHi = g.hi, legLo = g.lo, atrRef = g.atrRef, stopStart = bar_index, hs = array.new<float>(), ls = array.new<float>())
-        su.hs.push(high)
-        su.ls.push(low)
-        su.evalStop()
+        bool fromNext = i_stopFrom == "Bar after leg ends"
+        su := Setup.new(dir = g.dir, oid = (g.dir > 0 ? "L" : "S") + str.tostring(oidSeq), legStart = g.startBar, legEnd = g.endBar, legHi = g.hi, legLo = g.lo, atrRef = g.atrRef, stopStart = fromNext ? bar_index + 1 : bar_index, hs = array.new<float>(), ls = array.new<float>(), inScope = legScope)
+        if legScope
+            f_inc("setup.started")
+        if not fromNext
+            su.hs.push(high)
+            su.ls.push(low)
+            su.evalStop(atr)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 6 · Window end: cancel anything unfilled, optionally flatten
@@ -844,6 +914,8 @@ if not na(su)
         float tF   = math.round_to_mintick(pxE + d * i_tgtR * rPts)
         float tR   = math.round_to_mintick(pxE + d * i_runR * rPts)
         float tEnd = mg == 0 ? tF : tR
+        if not su.everOrd and su.inScope
+            f_inc("setup.ordered")
         strategy.entry(su.oid, d > 0 ? strategy.long : strategy.short, qty = qty, stop = pxE, comment = su.oid)
         // Bracket is attached before the fill so it protects the entry bar too.
         // Partial: the first exit reserves partial% of the position (qty_percent);
@@ -983,7 +1055,7 @@ if barstate.islast and i_showTable
     string pf    = nL > 0 ? str.tostring(sumW / -sumL, "0.00") : nW > 0 ? "∞" : "–"
 
     int row = 0
-    tStats.cell(0, row, "Go-Stop-Go research · " + syminfo.ticker + " · trades " + str.tostring(n) + (pending > 0 ? " (+" + str.tostring(pending) + " open)" : "") + " · setups armed " + str.tostring(nArmed), text_color = C_TXT, bgcolor = C_HEAD, text_size = tblSize, text_halign = text.align_left)
+    tStats.cell(0, row, "Go-Stop-Go research · " + syminfo.ticker + " · data from " + str.format_time(firstTime, "yyyy-MM-dd", TZ) + " · sessions " + str.tostring(sessNo) + " · trades " + str.tostring(n) + (pending > 0 ? " (+" + str.tostring(pending) + " open)" : "") + " · setups armed " + str.tostring(nArmed), text_color = C_TXT, bgcolor = C_HEAD, text_size = tblSize, text_halign = text.align_left)
     tStats.merge_cells(0, row, 12, row)
     row += 1
     array<string> hOv = array.from("Overall", "Trades", "Win%", "Avg R", "Med R", "Expect.", "PF", "Max DD R", "Max L strk", "Avg win", "Avg loss", "Total R", "Ambig.")
@@ -1056,6 +1128,63 @@ if barstate.islast and i_showTable
             tStats.merge_cells(0, row, 3, row)
             f_cell(tStats, 4, row, str.tostring(skipMap.get(k)), C_ROW)
             row += 1
+
+// Diagnostics funnel: where GO legs and STOPs drop out. Counts only legs that end
+// between (window start − max STOP bars) and window end. Failing STOP checks are
+// those failing on the setup's last bar with ≥ min bars; one setup can fail several.
+var table tDiag = na
+if barstate.islast and i_showDiag
+    if not na(tDiag)
+        tDiag.delete()
+    tDiag := table.new(position.bottom_left, 2, 40, bgcolor = C_ROW, border_color = C_HEAD, border_width = 1, frame_color = C_HEAD, frame_width = 1)
+    array<string> lbl = array.new<string>()
+    array<string> val = array.new<string>()
+    lbl.push("Diagnostics funnel · " + str.tostring(sessNo) + " sessions since " + str.format_time(firstTime, "yyyy-MM-dd", TZ))
+    val.push("")
+    lbl.push("GO legs ≥ " + str.tostring(i_legAtr) + "×ATR (both directions)")
+    val.push(str.tostring(nz(diag.get("leg.big"))))
+    lbl.push("   ✕ fewer than " + str.tostring(i_legSame) + " same-direction candles")
+    val.push(str.tostring(nz(diag.get("leg.failSame"))))
+    lbl.push("   ✕ avg body/range < " + str.tostring(i_legBody) + "%")
+    val.push(str.tostring(nz(diag.get("leg.failBody"))))
+    lbl.push("Valid GO legs")
+    val.push(str.tostring(nz(diag.get("leg.valid"))))
+    lbl.push("   in bias direction")
+    val.push(str.tostring(nz(diag.get("leg.bias"))))
+    lbl.push("      ✕ ignored: position open")
+    val.push(str.tostring(nz(diag.get("leg.inPos"))))
+    lbl.push("      ✕ ignored: order already working")
+    val.push(str.tostring(nz(diag.get("leg.pending"))))
+    lbl.push("Setups started (STOP tracking)")
+    val.push(str.tostring(nz(diag.get("setup.started"))))
+    lbl.push("   never became a valid STOP")
+    val.push(str.tostring(nz(diag.get("stop.never"))))
+    lbl.push("      died before " + str.tostring(i_stopMin) + " STOP bars")
+    val.push(str.tostring(nz(diag.get("stop.short"))))
+    lbl.push("      ✕ breakout level touched < " + str.tostring(i_bkTouch) + "×")
+    val.push(str.tostring(nz(diag.get("stop.fBk"))))
+    lbl.push("      ✕ opposite level touched < " + str.tostring(i_farTouch) + "×")
+    val.push(str.tostring(nz(diag.get("stop.fFar"))))
+    lbl.push("      ✕ highs drift > k×ATR")
+    val.push(str.tostring(nz(diag.get("stop.fDH"))))
+    lbl.push("      ✕ lows drift > k×ATR")
+    val.push(str.tostring(nz(diag.get("stop.fDL"))))
+    for k in diag.keys()
+        if str.startswith(k, "die:")
+            lbl.push("      died: " + str.substring(k, 4))
+            val.push(str.tostring(diag.get(k)))
+    lbl.push("   became a valid STOP")
+    val.push(str.tostring(nz(diag.get("stop.valid"))))
+    lbl.push("      armed (valid while window open)")
+    val.push(str.tostring(nArmed))
+    lbl.push("      order placed")
+    val.push(str.tostring(nz(diag.get("setup.ordered"))))
+    lbl.push("      filled")
+    val.push(str.tostring(nTaken))
+    for i = 0 to math.min(lbl.size(), 40) - 1
+        color bg = i == 0 ? C_HEAD : C_ROW
+        tDiag.cell(0, i, lbl.get(i), text_color = C_TXT, bgcolor = bg, text_size = tblSize, text_halign = text.align_left)
+        tDiag.cell(1, i, val.get(i), text_color = C_TXT, bgcolor = bg, text_size = tblSize, text_halign = text.align_right)
 
 // Optional per-trade log, newest first: the quickest way to audit individual rows.
 var table tLog = na
