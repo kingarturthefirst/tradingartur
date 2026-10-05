@@ -1,0 +1,2 @@
+# tradingartur
+artur trading plan
